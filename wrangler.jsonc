@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "wfg-voice-agent-analytics-ui",
+  "compatibility_date": "2025-12-01",
+  "assets": {
+    "not_found_handling": "single-page-application",
+  },
+  "routes": [
+    {
+      "pattern": "wfg-voice-agent-analytics.refind.studio",
+      "custom_domain": true,
+    },
+  ],
+}
