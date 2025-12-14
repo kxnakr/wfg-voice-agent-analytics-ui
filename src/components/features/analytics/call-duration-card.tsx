@@ -19,6 +19,7 @@ import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from "recharts"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ChartCard } from "@/components/chart-card"
+import { hasData, saveChartData, normalizeEmail } from "@/lib/api/analytics"
 import {
   useChartStore,
   type DurationPoint,
@@ -31,8 +32,17 @@ const durationConfig = {
   },
 }
 
+type OverlayStep = "none" | "email" | "confirm"
+
+const EMAIL_REGEX = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/
+
 export function CallDurationCard() {
   const [draftDuration, setDraftDuration] = React.useState<DurationPoint[]>([])
+  const [overlayStep, setOverlayStep] = React.useState<OverlayStep>("none")
+  const [emailInput, setEmailInput] = React.useState("")
+  const [flowError, setFlowError] = React.useState("")
+  const [isProcessing, setIsProcessing] = React.useState(false)
+  const pendingSaveRef = React.useRef<DurationPoint[] | null>(null)
 
   const {
     callDuration,
@@ -40,13 +50,23 @@ export function CallDurationCard() {
     isEditingDuration,
     setEditingDuration,
     setCallDuration,
+    setInitialCallDuration,
+    userEmail,
+    setUserEmail,
   } = useChartStore()
 
   React.useEffect(() => {
     if (isEditingDuration) {
       setDraftDuration(callDuration.map((point) => ({ ...point })))
+      setEmailInput(userEmail ?? "")
+      return
     }
-  }, [callDuration, isEditingDuration])
+
+    setOverlayStep("none")
+    setFlowError("")
+    setIsProcessing(false)
+    pendingSaveRef.current = null
+  }, [callDuration, isEditingDuration, userEmail])
 
   const handleChangePoint = (day: string, value: number) => {
     const nextValue = Number.isNaN(value) ? 0 : value
@@ -63,18 +83,72 @@ export function CallDurationCard() {
     setDraftDuration(initialCallDuration.map((point) => ({ ...point })))
   }
 
-  const handleSave = () => {
-    const sanitized = draftDuration.map((point) => ({
+  const sanitizeDraft = (points: DurationPoint[]) =>
+    points.map((point) => ({
       ...point,
       value: Number.isNaN(point.value) ? 0 : Math.max(point.value, 0),
     }))
-    setCallDuration(sanitized)
-    console.log({
-      chartKey: "call_duration_trend",
-      data: sanitized,
-      updatedAt: new Date().toISOString(),
-    })
-    setEditingDuration(false)
+
+  const handleSave = () => {
+    const sanitized = sanitizeDraft(draftDuration)
+    pendingSaveRef.current = sanitized
+    setFlowError("")
+
+    if (!userEmail) {
+      setEmailInput("")
+      setOverlayStep("email")
+      return
+    }
+
+    setEmailInput(userEmail)
+    void finalizeSave(userEmail)
+  }
+
+  const finalizeSave = async (
+    emailValue: string,
+    options: { checkExisting?: boolean } = { checkExisting: true }
+  ) => {
+    const normalizedEmail = normalizeEmail(emailValue)
+    const dataToSave = pendingSaveRef.current
+
+    if (!EMAIL_REGEX.test(normalizedEmail)) {
+      setFlowError("Enter a valid email address to save your changes.")
+      setOverlayStep("email")
+      return
+    }
+
+    if (!dataToSave) {
+      setFlowError("No changes to save. Please try again.")
+      return
+    }
+
+    setIsProcessing(true)
+    setFlowError("")
+
+    try {
+      if (options.checkExisting !== false) {
+        const exists = await hasData(normalizedEmail, "call_duration")
+        if (exists && overlayStep !== "confirm") {
+          setEmailInput(normalizedEmail)
+          setOverlayStep("confirm")
+          setIsProcessing(false)
+          return
+        }
+      }
+
+      await saveChartData(normalizedEmail, "call_duration", dataToSave)
+      setUserEmail(normalizedEmail)
+      setCallDuration(dataToSave)
+      setInitialCallDuration(dataToSave)
+      setOverlayStep("none")
+      pendingSaveRef.current = null
+      setEditingDuration(false)
+    } catch (error) {
+      console.error("Failed to save call duration data", error)
+      setFlowError("Unable to save right now. Please try again.")
+    } finally {
+      setIsProcessing(false)
+    }
   }
 
   return (
@@ -83,15 +157,106 @@ export function CallDurationCard() {
       description="Average handle time in seconds at the start of each month."
       action={
         <AlertDialog open={isEditingDuration} onOpenChange={setEditingDuration}>
-          <AlertDialogTrigger>
-            <Button
-              size="sm"
-              variant={isEditingDuration ? "secondary" : "outline"}
-            >
-              {isEditingDuration ? "Close" : "Edit"}
-            </Button>
-          </AlertDialogTrigger>
-          <AlertDialogContent className="max-h-[90vh] overflow-hidden">
+          <AlertDialogTrigger
+            render={
+              <Button
+                size="sm"
+                variant={isEditingDuration ? "secondary" : "outline"}
+              >
+                {isEditingDuration ? "Close" : "Edit"}
+              </Button>
+            }
+          />
+          <AlertDialogContent
+            size="lg"
+            className="relative max-h-[90vh] overflow-hidden"
+          >
+            {overlayStep !== "none" ? (
+              <div className="absolute inset-0 z-10 grid place-items-center bg-background/95 backdrop-blur-sm p-6">
+                <div className="w-full max-w-md space-y-4 rounded-3xl border border-border/50 bg-card/80 p-5 shadow-xl">
+                  {overlayStep === "email" ? (
+                    <>
+                      <div className="space-y-2">
+                        <h3 className="text-lg font-semibold">Save with your email</h3>
+                        <p className="text-sm text-muted-foreground">
+                          We save your call duration edits by email so you can pick up later.
+                        </p>
+                      </div>
+                      <Input
+                        autoFocus
+                        type="email"
+                        placeholder="you@example.com"
+                        value={emailInput}
+                        onChange={(event) => {
+                          setEmailInput(event.target.value)
+                          setFlowError("")
+                        }}
+                        disabled={isProcessing}
+                      />
+                      {flowError ? (
+                        <p className="text-sm text-destructive">{flowError}</p>
+                      ) : null}
+                      <div className="mt-2 flex items-center justify-end gap-2">
+                        <Button
+                          variant="outline"
+                          onClick={() => {
+                            setOverlayStep("none")
+                            setFlowError("")
+                          }}
+                          disabled={isProcessing}
+                        >
+                          Back
+                        </Button>
+                        <Button
+                          onClick={() => void finalizeSave(emailInput)}
+                          disabled={isProcessing}
+                        >
+                          {isProcessing ? "Checking..." : "Continue"}
+                        </Button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="space-y-2">
+                        <h3 className="text-lg font-semibold">Overwrite existing data?</h3>
+                        <p className="text-sm text-muted-foreground">
+                          We already have saved call duration data for{" "}
+                          <span className="font-medium">
+                            {emailInput || userEmail}
+                          </span>
+                          . Saving now will replace it.
+                        </p>
+                      </div>
+                      {flowError ? (
+                        <p className="text-sm text-destructive">{flowError}</p>
+                      ) : null}
+                      <div className="mt-2 flex items-center justify-end gap-2">
+                        <Button
+                          variant="outline"
+                          onClick={() => {
+                            setOverlayStep("email")
+                            setFlowError("")
+                          }}
+                          disabled={isProcessing}
+                        >
+                          Go back
+                        </Button>
+                        <Button
+                          onClick={() =>
+                            void finalizeSave(emailInput || userEmail || "", {
+                              checkExisting: false,
+                            })
+                          }
+                          disabled={isProcessing}
+                        >
+                          {isProcessing ? "Saving..." : "Confirm & Save"}
+                        </Button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            ) : null}
             <AlertDialogHeader>
               <AlertDialogTitle>Edit call duration</AlertDialogTitle>
               <AlertDialogDescription>
@@ -104,17 +269,22 @@ export function CallDurationCard() {
             />
             <AlertDialogFooter>
               <Button variant="outline" onClick={handleResetDraft}>
-                Reset to defaults
+                Reset
               </Button>
               <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <Button onClick={handleSave}>Save changes</Button>
+              <Button onClick={handleSave} disabled={isProcessing}>
+                Save changes
+              </Button>
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>
       }
     >
       <div className="rounded-2xl border border-border/60 bg-linear-to-b from-card via-card to-primary/5 p-2">
-        <ChartContainer config={durationConfig} className="h-80 w-full aspect-auto">
+        <ChartContainer
+          config={durationConfig}
+          className="h-64 w-full aspect-auto sm:h-80"
+        >
           <AreaChart
             data={callDuration}
             margin={{ left: 8, right: 8, top: 10, bottom: 10 }}
@@ -131,7 +301,7 @@ export function CallDurationCard() {
               tickLine={false}
               axisLine={false}
               tickMargin={10}
-              tick={{ fontSize: 12 }}
+              tick={{ fontSize: 11 }}
               minTickGap={22}
               tickFormatter={formatMonthLabel}
             />
@@ -139,8 +309,8 @@ export function CallDurationCard() {
               tickLine={false}
               axisLine={false}
               tickFormatter={(value) => formatSeconds(Number(value))}
-              width={72}
-              tick={{ fontSize: 12 }}
+              width={60}
+              tick={{ fontSize: 11 }}
             />
             <ChartTooltip
               cursor={false}

@@ -21,6 +21,7 @@ import { Cell, Pie, PieChart } from "recharts"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ChartCard } from "@/components/chart-card"
+import { hasData, saveChartData, normalizeEmail } from "@/lib/api/analytics"
 import { useChartStore, type OutcomeSlice } from "@/stores/chart-store"
 
 const outcomesConfig = {
@@ -31,17 +32,40 @@ const outcomesConfig = {
   "Customer Hostility": { label: "Customer Hostility", color: "var(--chart-5)" },
 } satisfies Record<string, { label: string; color: string }>
 
+type OverlayStep = "none" | "email" | "confirm"
+
+const EMAIL_REGEX = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/
+
 export function SadPathCard() {
   const [isEditing, setIsEditing] = React.useState(false)
   const [draftOutcomes, setDraftOutcomes] = React.useState<OutcomeSlice[]>([])
+  const [overlayStep, setOverlayStep] = React.useState<OverlayStep>("none")
+  const [emailInput, setEmailInput] = React.useState("")
+  const [flowError, setFlowError] = React.useState("")
+  const [isProcessing, setIsProcessing] = React.useState(false)
+  const pendingSaveRef = React.useRef<OutcomeSlice[] | null>(null)
 
-  const { callOutcomes, initialCallOutcomes, setCallOutcomes } = useChartStore()
+  const {
+    callOutcomes,
+    initialCallOutcomes,
+    setCallOutcomes,
+    setInitialCallOutcomes,
+    userEmail,
+    setUserEmail,
+  } = useChartStore()
 
   React.useEffect(() => {
     if (isEditing) {
       setDraftOutcomes(callOutcomes.map((slice) => ({ ...slice })))
+      setEmailInput(userEmail ?? "")
+      return
     }
-  }, [callOutcomes, isEditing])
+
+    setOverlayStep("none")
+    setFlowError("")
+    setIsProcessing(false)
+    pendingSaveRef.current = null
+  }, [callOutcomes, isEditing, userEmail])
 
   const leadingOutcome =
     callOutcomes.length > 0
@@ -67,18 +91,72 @@ export function SadPathCard() {
     setDraftOutcomes(initialCallOutcomes.map((slice) => ({ ...slice })))
   }
 
-  const handleSave = () => {
-    const sanitized = draftOutcomes.map((slice) => ({
+  const sanitizeDraft = (slices: OutcomeSlice[]) =>
+    slices.map((slice) => ({
       ...slice,
       value: Number.isNaN(slice.value) ? 0 : Math.max(slice.value, 0),
     }))
-    setCallOutcomes(sanitized)
-    console.log({
-      chartKey: "sad_path_analysis",
-      data: sanitized,
-      updatedAt: new Date().toISOString(),
-    })
-    setIsEditing(false)
+
+  const handleSave = () => {
+    const sanitized = sanitizeDraft(draftOutcomes)
+    pendingSaveRef.current = sanitized
+    setFlowError("")
+
+    if (!userEmail) {
+      setEmailInput("")
+      setOverlayStep("email")
+      return
+    }
+
+    setEmailInput(userEmail)
+    void finalizeSave(userEmail)
+  }
+
+  const finalizeSave = async (
+    emailValue: string,
+    options: { checkExisting?: boolean } = { checkExisting: true }
+  ) => {
+    const normalizedEmail = normalizeEmail(emailValue)
+    const dataToSave = pendingSaveRef.current
+
+    if (!EMAIL_REGEX.test(normalizedEmail)) {
+      setFlowError("Enter a valid email address to save your changes.")
+      setOverlayStep("email")
+      return
+    }
+
+    if (!dataToSave) {
+      setFlowError("No changes to save. Please try again.")
+      return
+    }
+
+    setIsProcessing(true)
+    setFlowError("")
+
+    try {
+      if (options.checkExisting !== false) {
+        const exists = await hasData(normalizedEmail, "sad_path")
+        if (exists && overlayStep !== "confirm") {
+          setEmailInput(normalizedEmail)
+          setOverlayStep("confirm")
+          setIsProcessing(false)
+          return
+        }
+      }
+
+      await saveChartData(normalizedEmail, "sad_path", dataToSave)
+      setUserEmail(normalizedEmail)
+      setCallOutcomes(dataToSave)
+      setInitialCallOutcomes(dataToSave)
+      setOverlayStep("none")
+      pendingSaveRef.current = null
+      setIsEditing(false)
+    } catch (error) {
+      console.error("Failed to save sad path data", error)
+      setFlowError("Unable to save right now. Please try again.")
+    } finally {
+      setIsProcessing(false)
+    }
   }
 
   return (
@@ -95,12 +173,103 @@ export function SadPathCard() {
       }
       action={
         <AlertDialog open={isEditing} onOpenChange={setIsEditing}>
-          <AlertDialogTrigger>
-            <Button size="sm" variant={isEditing ? "secondary" : "outline"}>
-              {isEditing ? "Close" : "Edit"}
-            </Button>
-          </AlertDialogTrigger>
-          <AlertDialogContent className="max-h-[90vh] overflow-hidden">
+          <AlertDialogTrigger
+            render={
+              <Button size="sm" variant={isEditing ? "secondary" : "outline"}>
+                {isEditing ? "Close" : "Edit"}
+              </Button>
+            }
+          />
+          <AlertDialogContent
+            size="lg"
+            className="relative max-h-[90vh] overflow-hidden"
+          >
+            {overlayStep !== "none" ? (
+              <div className="absolute inset-0 z-10 grid place-items-center bg-background/95 backdrop-blur-sm p-6">
+                <div className="w-full max-w-md space-y-4 rounded-3xl border border-border/50 bg-card/80 p-5 shadow-xl">
+                  {overlayStep === "email" ? (
+                    <>
+                      <div className="space-y-2">
+                        <h3 className="text-lg font-semibold">Save with your email</h3>
+                        <p className="text-sm text-muted-foreground">
+                          We store sad path edits by email so you can revisit them later.
+                        </p>
+                      </div>
+                      <Input
+                        autoFocus
+                        type="email"
+                        placeholder="you@example.com"
+                        value={emailInput}
+                        onChange={(event) => {
+                          setEmailInput(event.target.value)
+                          setFlowError("")
+                        }}
+                        disabled={isProcessing}
+                      />
+                      {flowError ? (
+                        <p className="text-sm text-destructive">{flowError}</p>
+                      ) : null}
+                      <div className="mt-2 flex items-center justify-end gap-2">
+                        <Button
+                          variant="outline"
+                          onClick={() => {
+                            setOverlayStep("none")
+                            setFlowError("")
+                          }}
+                          disabled={isProcessing}
+                        >
+                          Back
+                        </Button>
+                        <Button
+                          onClick={() => void finalizeSave(emailInput)}
+                          disabled={isProcessing}
+                        >
+                          {isProcessing ? "Checking..." : "Continue"}
+                        </Button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="space-y-2">
+                        <h3 className="text-lg font-semibold">Overwrite existing data?</h3>
+                        <p className="text-sm text-muted-foreground">
+                          We already have saved sad path data for{" "}
+                          <span className="font-medium">
+                            {emailInput || userEmail}
+                          </span>
+                          . Saving now will replace it.
+                        </p>
+                      </div>
+                      {flowError ? (
+                        <p className="text-sm text-destructive">{flowError}</p>
+                      ) : null}
+                      <div className="mt-2 flex items-center justify-end gap-2">
+                        <Button
+                          variant="outline"
+                          onClick={() => {
+                            setOverlayStep("email")
+                            setFlowError("")
+                          }}
+                          disabled={isProcessing}
+                        >
+                          Go back
+                        </Button>
+                        <Button
+                          onClick={() =>
+                            void finalizeSave(emailInput || userEmail || "", {
+                              checkExisting: false,
+                            })
+                          }
+                          disabled={isProcessing}
+                        >
+                          {isProcessing ? "Saving..." : "Confirm & Save"}
+                        </Button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            ) : null}
             <AlertDialogHeader>
               <AlertDialogTitle>Edit sad path distribution</AlertDialogTitle>
               <AlertDialogDescription>
@@ -110,10 +279,12 @@ export function SadPathCard() {
             <SadPathEditor points={draftOutcomes} onChange={handleChangeValue} />
             <AlertDialogFooter>
               <Button variant="outline" onClick={handleResetDraft}>
-                Reset to defaults
+                Reset
               </Button>
               <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <Button onClick={handleSave}>Save changes</Button>
+              <Button onClick={handleSave} disabled={isProcessing}>
+                Save changes
+              </Button>
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>
